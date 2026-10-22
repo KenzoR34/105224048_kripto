@@ -1,5 +1,1 @@
-.venv/
-__pycache__/
-*.py[cod]
-catatan.enc.json
-.env
+__pycache__/\n*.py[cod]\n.venv/\nvenv/\n.env\n*.key\nsecrets/\n

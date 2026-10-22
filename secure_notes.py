@@ -1,106 +1,77 @@
-"""Secure Notes: demo enkripsi catatan memakai AES-GCM dan PBKDF2-HMAC-SHA256."""
-import argparse
-import base64
-import json
-import os
+"""AES-256-GCM authenticated encryption demo."""
+import base64, json, os
 from pathlib import Path
-from getpass import getpass
-
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-ITERATIONS = 600_000
-SALT_BYTES = 16
-NONCE_BYTES = 12
-KEY_BYTES = 32
+KEY_LENGTH_BYTES = 32
+NONCE_LENGTH_BYTES = 12
+TAG_LENGTH_BYTES = 16
+AAD = b"secure-notes:v0.2"
 FORMAT_VERSION = 1
 
+class SecureNotesError(Exception):
+    """Raised when encrypted data cannot be safely authenticated/decrypted."""
 
-def derive_key(password: str, salt: bytes) -> bytes:
-    if not password:
-        raise ValueError("Password tidak boleh kosong.")
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=KEY_BYTES,
-        salt=salt,
-        iterations=ITERATIONS,
-    )
-    return kdf.derive(password.encode("utf-8"))
+def default_key_path():
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    root = Path(local_app_data) / "SecureNotes" if local_app_data else Path.home() / ".local" / "share" / "secure-notes"
+    return root / "aesgcm.key"
 
+def load_or_create_key(key_path=None):
+    path = Path(key_path) if key_path else default_key_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            key = path.read_bytes()
+            if len(key) != KEY_LENGTH_BYTES:
+                raise SecureNotesError("Panjang file kunci tidak valid.")
+            return key
+        key = AESGCM.generate_key(bit_length=256)
+        with path.open("xb") as f:
+            f.write(key)
+        return key
+    except FileExistsError:
+        key = path.read_bytes()
+        if len(key) != KEY_LENGTH_BYTES:
+            raise SecureNotesError("Panjang file kunci tidak valid.")
+        return key
+    except OSError as exc:
+        raise SecureNotesError("Kunci tidak dapat dibaca atau disimpan.") from exc
 
-def encrypt_text(plaintext: str, password: str) -> dict:
-    if not isinstance(plaintext, str) or not plaintext.strip():
-        raise ValueError("Catatan tidak boleh kosong.")
-    salt = os.urandom(SALT_BYTES)
-    nonce = os.urandom(NONCE_BYTES)
-    key = derive_key(password, salt)
-    ciphertext = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
-    return {
+def encrypt_text(text, key=None):
+    if not isinstance(text, str) or not text:
+        raise ValueError("Catatan harus berupa teks yang tidak kosong.")
+    key = load_or_create_key() if key is None else key
+    if not isinstance(key, bytes) or len(key) != KEY_LENGTH_BYTES:
+        raise ValueError("Kunci harus berupa bytes sepanjang 32 byte.")
+    nonce = os.urandom(NONCE_LENGTH_BYTES)
+    encrypted = AESGCM(key).encrypt(nonce, text.encode("utf-8"), AAD)
+    return json.dumps({
         "version": FORMAT_VERSION,
-        "kdf": "PBKDF2-HMAC-SHA256",
-        "iterations": ITERATIONS,
-        "cipher": "AES-256-GCM",
-        "salt": base64.b64encode(salt).decode("ascii"),
         "nonce": base64.b64encode(nonce).decode("ascii"),
-        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
-    }
+        "ciphertext": base64.b64encode(encrypted).decode("ascii"),
+        "aad": AAD.decode("ascii"),
+    }, separators=(",", ":"), sort_keys=True)
 
-
-def decrypt_text(payload: dict, password: str) -> str:
+def decrypt_text(envelope_text, key=None):
+    if not isinstance(envelope_text, str) or not envelope_text:
+        raise ValueError("Data terenkripsi harus berupa teks yang tidak kosong.")
+    key = load_or_create_key() if key is None else key
+    if not isinstance(key, bytes) or len(key) != KEY_LENGTH_BYTES:
+        raise ValueError("Kunci harus berupa bytes sepanjang 32 byte.")
     try:
-        if payload.get("version") != FORMAT_VERSION:
-            raise ValueError("Versi format tidak didukung.")
-        if payload.get("cipher") != "AES-256-GCM":
-            raise ValueError("Algoritma tidak didukung.")
-        salt = base64.b64decode(payload["salt"], validate=True)
-        nonce = base64.b64decode(payload["nonce"], validate=True)
-        ciphertext = base64.b64decode(payload["ciphertext"], validate=True)
-        if len(salt) != SALT_BYTES or len(nonce) != NONCE_BYTES:
-            raise ValueError("Format salt atau nonce tidak valid.")
-        key = derive_key(password, salt)
-        plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
-        return plaintext.decode("utf-8")
-    except InvalidTag as exc:
-        raise ValueError("Dekripsi gagal: password salah atau data telah diubah.") from exc
-    except (KeyError, TypeError, base64.binascii.Error) as exc:
-        raise ValueError("Berkas terenkripsi rusak atau formatnya tidak valid.") from exc
-
-
-def save_payload(payload: dict, output_path: str) -> None:
-    Path(output_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def load_payload(input_path: str) -> dict:
-    try:
-        return json.loads(Path(input_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("Berkas tidak dapat dibaca atau bukan JSON valid.") from exc
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Secure Notes: enkripsi/dekripsi catatan.")
-    sub = parser.add_subparsers(dest="command", required=True)
-    enc = sub.add_parser("encrypt", help="Enkripsi catatan teks ke berkas JSON.")
-    enc.add_argument("--out", default="catatan.enc.json", help="Nama berkas keluaran.")
-    dec = sub.add_parser("decrypt", help="Dekripsi berkas JSON.")
-    dec.add_argument("--infile", default="catatan.enc.json", help="Berkas masukan.")
-    args = parser.parse_args()
-
-    try:
-        password = getpass("Password: ")
-        if args.command == "encrypt":
-            note = input("Masukkan catatan: ")
-            payload = encrypt_text(note, password)
-            save_payload(payload, args.out)
-            print(f"Berhasil dienkripsi. Hasil disimpan di: {args.out}")
-        else:
-            payload = load_payload(args.infile)
-            print("Catatan asli:", decrypt_text(payload, password))
-    except (ValueError, OSError) as exc:
-        parser.exit(1, f"Error: {exc}\n")
-
-
-if __name__ == "__main__":
-    main()
+        env = json.loads(envelope_text)
+        if not isinstance(env, dict) or env.get("version") != FORMAT_VERSION:
+            raise SecureNotesError("Format atau versi data tidak valid.")
+        if env.get("aad") != AAD.decode("ascii"):
+            raise SecureNotesError("AAD tidak valid.")
+        nonce = base64.b64decode(env["nonce"], validate=True)
+        encrypted = base64.b64decode(env["ciphertext"], validate=True)
+        if len(nonce) != NONCE_LENGTH_BYTES or len(encrypted) < TAG_LENGTH_BYTES:
+            raise SecureNotesError("Nonce atau ciphertext/tag tidak valid.")
+        return AESGCM(key).decrypt(nonce, encrypted, AAD).decode("utf-8")
+    except (InvalidTag, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        if isinstance(exc, SecureNotesError):
+            raise
+        raise SecureNotesError("Dekripsi gagal: data rusak atau kunci salah.") from exc
